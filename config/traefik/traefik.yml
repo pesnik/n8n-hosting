@@ -1,0 +1,48 @@
+# Traefik static configuration
+global:
+  checkNewVersion: true
+  sendAnonymousUsage: false
+
+api:
+  dashboard: false
+  debug: false
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: "n8n_n8n-network"
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+entrypoints:
+  web:
+    address: ":8180"
+  n8n:
+    address: ":8645"
+    http:
+      tls:
+        certResolver: "local"
+        options: "default"
+  grafana:
+    address: ":8646"
+    http:
+      tls:
+        certResolver: "local"
+        options: "default"
+
+ping:
+  entryPoint: "traefik"        
+
+certificatesResolvers:
+  local:
+    acme:
+      storage: /etc/traefik/acme.json
+
+log:
+  level: info
+  format: json
+
+accessLog:
+  format: json

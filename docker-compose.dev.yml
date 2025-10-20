@@ -1,0 +1,344 @@
+# ============================================================================
+# n8n Development Stack - Single Host (docker-compose)
+# For dev server: docker-compose -f docker-compose.dev.yml up
+# For production: docker stack deploy -c docker-stack.yaml n8n-prod
+# ============================================================================
+
+version: '3.8'
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  n8n_data:
+    driver: local
+  traefik_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  alertmanager_data:
+    driver: local
+
+networks:
+  n8n-network:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: "-c max_connections=${DB_MAX_CONNECTIONS} -c shared_buffers=${DB_SHARED_BUFFERS} -c effective_cache_size=${DB_EFFECTIVE_CACHE_SIZE} -c work_mem=${DB_WORK_MEM}"
+      TZ: ${TIMEZONE}
+      POSTGRES_SHARED_PRELOAD_LIBRARIES: pg_stat_statements
+      # Set the configuration parameters once the library is loaded
+      POSTGRES_PG_STAT_STATEMENTS_TRACK: all
+      POSTGRES_PG_STAT_STATEMENTS_MAX: 10000      
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/postgres/init-data.sql:/docker-entrypoint-initdb.d/init-data.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - "everysec"
+      - --maxmemory
+      - "${REDIS_MAXMEMORY}"
+      - --maxmemory-policy
+      - "${REDIS_MAXMEMORY_POLICY}"
+      - --requirepass
+      - "${REDIS_PASSWORD}"
+      - --port
+      - "${REDIS_PORT}"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-p', '${REDIS_PORT}', '-a', '${REDIS_PASSWORD}', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  traefik:
+    image: traefik:v3.5.3
+    restart: always
+    command:
+      - "--global.checkNewVersion=true"
+      - "--global.sendAnonymousUsage=false"
+      - "--api.dashboard=false"
+      - "--api.debug=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=n8n_n8n-network"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:8280"
+      - "--entrypoints.n8n.address=:8645"
+      - "--entrypoints.grafana.address=:8646"
+      - "--ping.entrypoint=traefik"
+      - "--ping=true"
+      - "--entrypoints.traefik.address=:8080"        
+      - "--log.level=warn"
+      - "--log.format=json"
+      - "--accesslog=false"
+    ports:
+      - "8280:8280"
+      - "8645:8645"
+      - "8646:8646"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_data:/etc/traefik
+      - ./config/traefik/traefik.dev.yml:/etc/traefik/traefik.yml:ro
+      - ./config/traefik/dynamic.dev.yml:/etc/traefik/dynamic.yml:ro
+      - ./config/traefik/certs/wildcard_agentshq_net.crt:/etc/traefik/certs/wildcard_agentshq_net.crt:ro
+      - ./config/traefik/certs/wildcard_agentshq_net.key:/etc/traefik/certs/wildcard_agentshq_net.key:ro
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:8080/ping']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      n8n-main:
+        condition: service_healthy
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  n8n-main:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: always
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SSL: "false"
+      
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT}
+      QUEUE_BULL_REDIS_DB: 0
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      QUEUE_HEALTH_CHECK_ACTIVE: "true"
+      
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD_HASH: ${N8N_BASIC_AUTH_PASSWORD_HASH}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      N8N_SECURE_COOKIE: "true"
+      WEBHOOK_URL: "https://${MANAGER_HOST}:${N8N_PORT}/"
+      WEBHOOK_TUNNEL_URL: "https://${MANAGER_HOST}:${N8N_PORT}/"
+      
+      GENERIC_TIMEZONE: ${TIMEZONE}
+      TZ: ${TIMEZONE}
+      
+      LOG_LEVEL: ${LOG_LEVEL}
+      N8N_DEFAULT_EXECUTION_TIMEOUT: ${N8N_EXECUTION_TIMEOUT}
+      N8N_PAYLOAD_SIZE_MAX: ${N8N_PAYLOAD_SIZE_MAX}
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"
+      EXECUTIONS_DATA_PRUNE_SOFT_DELETE_TIMEOUT: 720
+      N8N_DIAGNOSTICS_ENABLED: "${N8N_DIAGNOSTICS_ENABLED}"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:5678/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5        
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      - "traefik.docker.network=n8n_n8n-network"
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`n8n.agentshq.net`)"
+      - "traefik.http.routers.n8n.entrypoints=n8n"
+      - "traefik.http.routers.n8n.tls=true"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+      # - "traefik.http.middlewares.n8n-auth.basicauth.users=admin:${N8N_BASIC_AUTH_HASH}"        
+      # - "traefik.http.routers.n8n.middlewares=n8n-auth"
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  n8n-worker:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: always
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mkdir -p /home/node/.n8n
+        chmod 755 /home/node/.n8n
+        node /usr/local/lib/node_modules/n8n/bin/n8n worker --concurrency=${N8N_WORKER_CONCURRENCY}
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SSL: "false"
+      
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT}
+      QUEUE_BULL_REDIS_DB: 0
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      
+      GENERIC_TIMEZONE: ${TIMEZONE}
+      TZ: ${TIMEZONE}
+      
+      LOG_LEVEL: ${LOG_LEVEL}
+      N8N_DEFAULT_EXECUTION_TIMEOUT: ${N8N_EXECUTION_TIMEOUT}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q 'n8n worker' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=45d"
+      - "--web.listen-address=:9490"
+    ports:
+      - "9490:9490"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: "https://${MANAGER_HOST}:${GRAFANA_PORT}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      TZ: ${TIMEZONE}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`n8n.agentshq.net`)"
+      - "traefik.http.routers.grafana.entrypoints=grafana"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    restart: always
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.listen-address=:9493"
+    ports:
+      - "9493:9493"
+    volumes:
+      - alertmanager_data:/alertmanager
+      - ./config/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:9493/-/healthy']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "30m"
+        max-file: "3"

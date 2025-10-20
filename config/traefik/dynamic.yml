@@ -1,0 +1,117 @@
+http:
+  middlewares:
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+    compress:
+      compress:
+        excludedContentTypes:
+          - text/event-stream
+          - application/grpc
+    security-headers:
+      headers:
+        customResponseHeaders:
+          X-Content-Type-Options: "nosniff"
+          X-Frame-Options: "SAMEORIGIN"
+          X-XSS-Protection: "1; mode=block"
+          Referrer-Policy: "strict-origin-when-cross-origin"
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+    n8n-rate-limit:
+      rateLimit:
+        average: 100
+        period: 60s
+        burst: 50
+
+  routers:
+    n8n-main:
+      rule: "Host(`n8n.agentshq.net`)"
+      service: n8n-main
+      entrypoints:
+        - n8n
+      middlewares:
+        - security-headers
+        - compress
+      tls:
+        options: default
+
+    n8n-api:
+      rule: "Host(`n8n.agentshq.net`) && PathPrefix(`/api`)"
+      service: n8n-main
+      entrypoints:
+        - n8n
+      middlewares:
+        - security-headers
+        - n8n-rate-limit
+        - compress
+      tls:
+        options: default
+
+    n8n-webhooks:
+      rule: "Host(`n8n.agentshq.net`) && PathPrefix(`/webhook`)"
+      service: n8n-main
+      entrypoints:
+        - n8n
+      middlewares:
+        - security-headers
+        - compress
+      tls:
+        options: default
+
+    grafana:
+      rule: "Host(`n8n.agentshq.net`)"
+      service: grafana
+      entrypoints:
+        - grafana
+      middlewares:
+        - security-headers
+        - compress
+      tls:
+        options: default
+
+    prometheus:
+      rule: "Host(`n8n.agentshq.net`)"
+      service: prometheus
+      entrypoints:
+        - web
+      middlewares:
+        - security-headers
+
+  services:
+    n8n-main:
+      loadBalancer:
+        servers:
+          - url: "http://n8n-main:5678"
+        sticky:
+          cookie:
+            name: n8n-session
+            secure: true
+            httpOnly: true
+            sameSite: "Strict"
+
+    grafana:
+      loadBalancer:
+        servers:
+          - url: "http://grafana:3000"
+
+    prometheus:
+      loadBalancer:
+        servers:
+          - url: "http://prometheus:9490"
+
+tls:
+  options:
+    default:
+      minVersion: "VersionTLS12"
+      cipherSuites:
+        - "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+        - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        - "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+      sniStrict: true
+
+  certificates:
+    - certFile: /etc/traefik/certs/wildcard_agentshq_net.crt
+      keyFile: /etc/traefik/certs/wildcard_agentshq_net.key
+      stores:
+        default: {}

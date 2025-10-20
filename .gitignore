@@ -1,0 +1,9 @@
+.env*
+!.env.template
+
+*.key
+*.crt
+certs
+
+volumes
+images
