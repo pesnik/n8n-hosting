@@ -1,360 +1,271 @@
 ---
-# Prometheus Alert Rules
-# Reference: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+# Prometheus Alert Rules - Production N8N Stack
+# Comprehensive alerting for service health and performance
 
 groups:
-  # n8n Application Alerts
-  - name: n8n_application
+  # Docker Container Resource Alerts
+  - name: container_resources
     interval: 30s
     rules:
-      # n8n service down
-      - alert: N8nServiceDown
-        expr: up{job=~"n8n-main|n8n-workers"} == 0
-        for: 2m
-        annotations:
-          summary: "n8n {{ $labels.job }} is down"
-          description: "{{ $labels.job }} has been unreachable for more than 2 minutes"
-          severity: critical
-        labels:
-          service: n8n
-          severity: critical
-
-      # High queue depth
-      - alert: HighQueueDepth
-        expr: redis_llen_key_value{key=~"bull:n8n:.*"} > 500
+      # High container CPU usage
+      - alert: HighContainerCPU
+        expr: |
+          rate(engine_daemon_container_cpu_usage_seconds_total{
+            container_name=~"n8n.*|postgres.*|redis.*|traefik.*|grafana.*"
+          }[5m]) > 0.80
         for: 5m
         annotations:
-          summary: "n8n queue depth is high ({{ $value }} items)"
-          description: "Redis queue contains {{ $value }} pending executions. Workers may be overloaded."
+          summary: "High CPU usage in container {{ $labels.container_name }}"
+          description: "Container {{ $labels.container_name }} CPU usage is {{ $value | humanizePercentage }} for 5 minutes"
           severity: warning
         labels:
-          service: n8n
+          service: docker
           severity: warning
+          container: "{{ $labels.container_name }}"
 
-      # Very high queue depth
-      - alert: CriticalQueueDepth
-        expr: redis_llen_key_value{key=~"bull:n8n:.*"} > 2000
-        for: 10m
-        annotations:
-          summary: "n8n queue is critically backed up ({{ $value }} items)"
-          description: "Redis queue has {{ $value }} items. Immediate scaling recommended."
-          severity: critical
-        labels:
-          service: n8n
-          severity: critical
-
-      # High workflow failure rate
-      - alert: HighWorkflowFailureRate
-        expr: rate(n8n_execution_failed_total[5m]) / (rate(n8n_execution_success_total[5m]) + rate(n8n_execution_failed_total[5m])) > 0.05
-        for: 10m
-        annotations:
-          summary: "n8n workflow failure rate is high ({{ $value | humanizePercentage }})"
-          description: "More than 5% of workflows are failing. Check n8n logs for errors."
-          severity: warning
-        labels:
-          service: n8n
-          severity: warning
-
-      # Critical failure rate
-      - alert: CriticalWorkflowFailureRate
-        expr: rate(n8n_execution_failed_total[5m]) / (rate(n8n_execution_success_total[5m]) + rate(n8n_execution_failed_total[5m])) > 0.20
-        for: 5m
-        annotations:
-          summary: "n8n workflow failure rate is critical ({{ $value | humanizePercentage }})"
-          description: "More than 20% of workflows are failing. Immediate investigation needed."
-          severity: critical
-        labels:
-          service: n8n
-          severity: critical
-
-      # Long execution times
-      - alert: LongExecutionTimes
-        expr: histogram_quantile(0.95, rate(n8n_execution_duration_seconds_bucket[5m])) > 300
-        for: 10m
-        annotations:
-          summary: "n8n workflows have high p95 execution time ({{ $value }}s)"
-          description: "95th percentile execution time exceeds 5 minutes. Consider optimizing workflows."
-          severity: warning
-        labels:
-          service: n8n
-          severity: warning
-
-      # No active workers
-      - alert: NoActiveWorkers
-        expr: count(up{job="n8n-workers"} == 1) == 0
+      # Critical container CPU usage
+      - alert: CriticalContainerCPU
+        expr: |
+          rate(engine_daemon_container_cpu_usage_seconds_total{
+            container_name=~"n8n.*|postgres.*|redis.*|traefik.*"
+          }[5m]) > 0.95
         for: 2m
         annotations:
-          summary: "No n8n workers are running"
-          description: "All n8n workers are down. Queued jobs will not execute."
+          summary: "Critical CPU usage in container {{ $labels.container_name }}"
+          description: "Container {{ $labels.container_name }} CPU usage is {{ $value | humanizePercentage }} - immediate action required"
           severity: critical
         labels:
-          service: n8n
+          service: docker
           severity: critical
+          container: "{{ $labels.container_name }}"
 
-  # Database Alerts
-  - name: database
+      # High container memory usage
+      - alert: HighContainerMemory
+        expr: |
+          (engine_daemon_container_memory_usage_bytes{
+            container_name=~"n8n.*|postgres.*|redis.*|traefik.*|grafana.*"
+          } / 
+          engine_daemon_container_memory_limit_bytes) > 0.85
+        for: 5m
+        annotations:
+          summary: "High memory usage in container {{ $labels.container_name }}"
+          description: "Container {{ $labels.container_name }} memory usage is {{ $value | humanizePercentage }}"
+          severity: warning
+        labels:
+          service: docker
+          severity: warning
+          container: "{{ $labels.container_name }}"
+
+      # Critical container memory usage
+      - alert: CriticalContainerMemory
+        expr: |
+          (engine_daemon_container_memory_usage_bytes{
+            container_name=~"n8n.*|postgres.*|redis.*|traefik.*"
+          } / 
+          engine_daemon_container_memory_limit_bytes) > 0.95
+        for: 2m
+        annotations:
+          summary: "Critical memory usage in container {{ $labels.container_name }}"
+          description: "Container {{ $labels.container_name }} memory at {{ $value | humanizePercentage }} - OOM risk"
+          severity: critical
+        labels:
+          service: docker
+          severity: critical
+          container: "{{ $labels.container_name }}"
+
+      # Container health check failing
+      - alert: ContainerUnhealthy
+        expr: |
+          engine_daemon_health_checks_failed_total{
+            container_name=~"n8n.*|postgres.*|redis.*|traefik.*"
+          } > 3
+        for: 2m
+        annotations:
+          summary: "Container {{ $labels.container_name }} health check failing"
+          description: "Container has failed {{ $value }} consecutive health checks"
+          severity: critical
+        labels:
+          service: docker
+          severity: critical
+          container: "{{ $labels.container_name }}"
+
+  # Traefik Ingress Alerts
+  - name: traefik_ingress
     interval: 30s
     rules:
-      # PostgreSQL service down
-      - alert: PostgresDown
-        expr: up{job="postgres"} == 0
+      # High request error rate
+      - alert: HighTraefikErrorRate
+        expr: |
+          (sum(rate(traefik_service_requests_total{code=~"5.."}[5m])) by (service) /
+           sum(rate(traefik_service_requests_total[5m])) by (service)) > 0.05
+        for: 5m
+        annotations:
+          summary: "High error rate on Traefik service {{ $labels.service }}"
+          description: "{{ $value | humanizePercentage }} of requests returning 5xx errors"
+          severity: warning
+        labels:
+          service: traefik
+          severity: warning
+
+      # Critical error rate
+      - alert: CriticalTraefikErrorRate
+        expr: |
+          (sum(rate(traefik_service_requests_total{code=~"5.."}[5m])) by (service) /
+           sum(rate(traefik_service_requests_total[5m])) by (service)) > 0.20
+        for: 2m
+        annotations:
+          summary: "Critical error rate on Traefik service {{ $labels.service }}"
+          description: "{{ $value | humanizePercentage }} of requests failing - service degraded"
+          severity: critical
+        labels:
+          service: traefik
+          severity: critical
+
+      # High request latency
+      - alert: HighTraefikLatency
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(traefik_service_request_duration_seconds_bucket[5m])) by (service, le)
+          ) > 5
+        for: 10m
+        annotations:
+          summary: "High latency on Traefik service {{ $labels.service }}"
+          description: "P95 latency is {{ $value }}s (threshold: 5s)"
+          severity: warning
+        labels:
+          service: traefik
+          severity: warning
+
+      # Backend service down
+      - alert: TraefikBackendDown
+        expr: traefik_service_server_up == 0
         for: 1m
         annotations:
-          summary: "PostgreSQL is down"
-          description: "PostgreSQL service has been unreachable for more than 1 minute"
+          summary: "Traefik backend {{ $labels.service }} is down"
+          description: "Backend service {{ $labels.service }} is unreachable"
           severity: critical
         labels:
-          service: postgres
+          service: traefik
           severity: critical
 
-      # High connection usage
-      - alert: HighDatabaseConnections
-        expr: postgresql_connections_used > 160
-        for: 5m
-        annotations:
-          summary: "PostgreSQL connection pool is near limit ({{ $value }}/200)"
-          description: "Database connections are {{ $value }}/200. Consider reducing connections or increasing pool."
-          severity: warning
-        labels:
-          service: postgres
-          severity: warning
-
-      # Database connections at max
-      - alert: DatabaseConnectionPoolExhausted
-        expr: postgresql_connections_used > 190
-        for: 2m
-        annotations:
-          summary: "PostgreSQL connection pool is nearly exhausted ({{ $value }}/200)"
-          description: "New connections may be rejected. Scale or reduce client connections."
-          severity: critical
-        labels:
-          service: postgres
-          severity: critical
-
-      # High database cache miss ratio
-      - alert: HighCacheMissRatio
-        expr: rate(postgresql_cache_miss_ratio[5m]) > 0.5
-        for: 10m
-        annotations:
-          summary: "PostgreSQL cache miss ratio is high ({{ $value | humanizePercentage }})"
-          description: "More than 50% of queries are missing cache. Consider adding more memory."
-          severity: warning
-        labels:
-          service: postgres
-          severity: warning
-
-      # Slow queries detected
-      - alert: SlowQueries
-        expr: pg_slow_queries > 10
-        for: 5m
-        annotations:
-          summary: "PostgreSQL has slow queries ({{ $value }})"
-          description: "{{ $value }} slow queries detected. Review query logs."
-          severity: warning
-        labels:
-          service: postgres
-          severity: warning
-
-      # Database replication lag
-      - alert: ReplicationLag
-        expr: pg_replication_lag_seconds > 30
-        for: 5m
-        annotations:
-          summary: "PostgreSQL replication lag is high ({{ $value }}s)"
-          description: "Replica is {{ $value }}s behind primary"
-          severity: warning
-        labels:
-          service: postgres
-          severity: warning
-
-  # Redis Alerts
-  - name: redis
+  # Service Health Alerts
+  - name: service_health
     interval: 30s
     rules:
-      # Redis service down
-      - alert: RedisDown
-        expr: up{job="redis"} == 0
-        for: 1m
-        annotations:
-          summary: "Redis is down"
-          description: "Redis service has been unreachable for more than 1 minute"
-          severity: critical
-        labels:
-          service: redis
-          severity: critical
-
-      # High memory usage
-      - alert: HighRedisMemory
-        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.8
-        for: 5m
-        annotations:
-          summary: "Redis memory is high ({{ $value | humanizePercentage }})"
-          description: "Redis is using {{ $value | humanizePercentage }} of available memory"
-          severity: warning
-        labels:
-          service: redis
-          severity: warning
-
-      # Redis memory exhaustion imminent
-      - alert: RedisMemoryExhaustion
-        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.95
+      # Prometheus down
+      - alert: PrometheusDown
+        expr: up{job="prometheus"} == 0
         for: 2m
         annotations:
-          summary: "Redis memory is critically high ({{ $value | humanizePercentage }})"
-          description: "Redis may run out of memory soon"
+          summary: "Prometheus monitoring is down"
+          description: "Prometheus has been unreachable for 2+ minutes - monitoring blind"
           severity: critical
         labels:
-          service: redis
+          service: prometheus
           severity: critical
 
-      # High eviction rate
-      - alert: HighRedisEvictionRate
-        expr: rate(redis_evicted_keys_total[5m]) > 100
-        for: 5m
-        annotations:
-          summary: "Redis eviction rate is high ({{ $value }} keys/sec)"
-          description: "Many keys are being evicted due to memory pressure"
-          severity: warning
-        labels:
-          service: redis
-          severity: warning
-
-  # Host/Node Alerts
-  - name: host
-    interval: 30s
-    rules:
-      # High CPU usage
-      - alert: HighCPUUsage
-        expr: (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)) > 0.8
-        for: 5m
-        annotations:
-          summary: "High CPU usage on {{ $labels.instance }} ({{ $value | humanizePercentage }})"
-          description: "CPU utilization exceeds 80%"
-          severity: warning
-        labels:
-          service: host
-          severity: warning
-
-      # Very high CPU usage
-      - alert: CriticalCPUUsage
-        expr: (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)) > 0.95
-        for: 5m
-        annotations:
-          summary: "Critical CPU usage on {{ $labels.instance }} ({{ $value | humanizePercentage }})"
-          description: "CPU utilization exceeds 95%"
-          severity: critical
-        labels:
-          service: host
-          severity: critical
-
-      # High memory usage
-      - alert: HighMemoryUsage
-        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.85
-        for: 5m
-        annotations:
-          summary: "High memory usage on {{ $labels.instance }} ({{ $value | humanizePercentage }})"
-          description: "Memory utilization exceeds 85%"
-          severity: warning
-        labels:
-          service: host
-          severity: warning
-
-      # Critical memory usage
-      - alert: CriticalMemoryUsage
-        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.95
-        for: 2m
-        annotations:
-          summary: "Critical memory usage on {{ $labels.instance }} ({{ $value | humanizePercentage }})"
-          description: "Memory utilization exceeds 95%"
-          severity: critical
-        labels:
-          service: host
-          severity: critical
-
-      # High disk usage
-      - alert: HighDiskUsage
-        expr: (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) > 0.85
-        for: 5m
-        annotations:
-          summary: "High disk usage on {{ $labels.instance }} ({{ $value | humanizePercentage }})"
-          description: "Disk utilization exceeds 85% on {{ $labels.device }}"
-          severity: warning
-        labels:
-          service: host
-          severity: warning
-
-      # Critical disk usage
-      - alert: CriticalDiskUsage
-        expr: (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) > 0.95
-        for: 2m
-        annotations:
-          summary: "Critical disk usage on {{ $labels.instance }} ({{ $value | humanizePercentage }})"
-          description: "Disk utilization exceeds 95% on {{ $labels.device }}"
-          severity: critical
-        labels:
-          service: host
-          severity: critical
-
-      # Node down
-      - alert: NodeDown
-        expr: up{job="node"} == 0
-        for: 1m
-        annotations:
-          summary: "Node {{ $labels.instance }} is down"
-          description: "Node has been unreachable for more than 1 minute"
-          severity: critical
-        labels:
-          service: host
-          severity: critical
-
-  # Infrastructure Alerts
-  - name: infrastructure
-    interval: 30s
-    rules:
       # Traefik down
       - alert: TraefikDown
         expr: up{job="traefik"} == 0
         for: 1m
         annotations:
           summary: "Traefik reverse proxy is down"
-          description: "Traefik has been unreachable for more than 1 minute. No ingress traffic possible."
+          description: "All ingress traffic blocked - immediate intervention required"
           severity: critical
         labels:
           service: traefik
           severity: critical
 
-      # High Traefik error rate
-      - alert: HighTraefikErrorRate
-        expr: rate(traefik_entrypoint_requests_total{code=~"5.."}[5m]) > 0.05
-        for: 5m
-        annotations:
-          summary: "Traefik has high error rate ({{ $value | humanizePercentage }})"
-          description: "More than 5% of requests are returning 5xx errors"
-          severity: warning
-        labels:
-          service: traefik
-          severity: warning
-
-      # Prometheus down
-      - alert: PrometheusDown
-        expr: up{job="prometheus"} == 0
-        for: 1m
-        annotations:
-          summary: "Prometheus monitoring is down"
-          description: "Prometheus has been unreachable for more than 1 minute. Monitoring blind."
-          severity: critical
-        labels:
-          service: prometheus
-          severity: critical
-
-      # Alertmanager down
+      # AlertManager down
       - alert: AlertmanagerDown
         expr: up{job="alertmanager"} == 0
-        for: 1m
+        for: 2m
         annotations:
           summary: "AlertManager is down"
-          description: "AlertManager is unreachable. Alerts may not be sent."
-          severity: critical
+          description: "Alert notifications will not be delivered"
+          severity: warning
         labels:
           service: alertmanager
-          severity: critical
+          severity: warning
+
+      # Docker daemon unreachable
+      - alert: DockerDaemonDown
+        expr: up{job="docker"} == 0
+        for: 1m
+        annotations:
+          summary: "Docker daemon metrics unavailable"
+          description: "Cannot collect container metrics - check Docker daemon"
+          severity: warning
+        labels:
+          service: docker
+          severity: warning
+
+      # Grafana down
+      - alert: GrafanaDown
+        expr: up{job="grafana"} == 0
+        for: 5m
+        annotations:
+          summary: "Grafana dashboard is down"
+          description: "Visualization interface unavailable"
+          severity: warning
+        labels:
+          service: grafana
+          severity: warning
+
+  # Docker System Health
+  - name: docker_system
+    interval: 30s
+    rules:
+      # High number of containers
+      - alert: TooManyContainers
+        expr: engine_daemon_container_states_containers{state="running"} > 50
+        for: 10m
+        annotations:
+          summary: "High number of running containers"
+          description: "{{ $value }} containers running - potential resource exhaustion"
+          severity: warning
+        labels:
+          service: docker
+          severity: warning
+
+      # Container restarts
+      - alert: ContainerRestarting
+        expr: |
+          rate(engine_daemon_container_actions_seconds_count{action="restart"}[5m]) > 0.1
+        for: 5m
+        annotations:
+          summary: "Containers restarting frequently"
+          description: "Restart rate: {{ $value }} restarts/sec"
+          severity: warning
+        labels:
+          service: docker
+          severity: warning
+
+  # AlertManager Health
+  - name: alertmanager_health
+    interval: 60s
+    rules:
+      # Notifications failing
+      - alert: AlertmanagerNotificationsFailing
+        expr: |
+          rate(alertmanager_notifications_failed_total[5m]) > 0.1
+        for: 5m
+        annotations:
+          summary: "AlertManager notification failures"
+          description: "{{ $value }} notifications/sec failing to send"
+          severity: warning
+        labels:
+          service: alertmanager
+          severity: warning
+
+      # High alert load
+      - alert: HighAlertLoad
+        expr: alertmanager_alerts > 100
+        for: 10m
+        annotations:
+          summary: "High number of active alerts"
+          description: "{{ $value }} active alerts - potential alert storm"
+          severity: warning
+        labels:
+          service: alertmanager
+          severity: warning
