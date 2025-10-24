@@ -1,6 +1,5 @@
 # ============================================================================
 # n8n Production Stack - OrbStack Single-Node Configuration
-# All services run on the single manager node (no separate workers)
 # ============================================================================
 version: '3.8'
 
@@ -14,8 +13,6 @@ volumes:
   n8n_mcp_data:
     driver: local
   n8n_worker_data:
-    driver: local
-  traefik_data:
     driver: local
   letsencrypt:
     driver: local
@@ -51,11 +48,6 @@ services:
       start_period: 10s
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
 
   redis:
     image: redis:7-alpine
@@ -79,11 +71,6 @@ services:
       start_period: 10s
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
 
   traefik:
     image: traefik:v3.5.3
@@ -96,8 +83,33 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
-      - ./config/traefik/traefik.dev.yml:/etc/traefik/traefik.yml:ro
-      - ./config/traefik/dynamic.dev.yml:/etc/traefik/dynamic.yml:ro
+    command:
+      # Global
+      - "--global.checkNewVersion=false"
+      - "--global.sendAnonymousUsage=false"
+      # API
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--api.debug=true"
+      # Logging
+      - "--log.level=DEBUG"
+      - "--log.format=common"
+      # Entrypoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.traefik.address=:8080"
+      # HTTP Redirect
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # Docker Provider
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=n8n-network"
+      - "--providers.docker.watch=true"
+      # Let's Encrypt
+      - "--certificatesresolvers.letsencrypt.acme.email=pesnik@outlook.com"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
     healthcheck:
       test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:8080/ping']
       interval: 10s
@@ -106,11 +118,6 @@ services:
       start_period: 5s
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
 
   n8n-webhook:
     image: docker.n8n.io/n8nio/n8n:latest
@@ -118,13 +125,24 @@ services:
       replicas: 1
       labels:
         - "traefik.enable=true"
-        - "traefik.docker.network=n8n_n8n-network"
-        - "traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)"
-        - "traefik.http.routers.n8n.entrypoints=websecure"
-        - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
-        - "traefik.http.routers.n8n.priority=10"
-        - "traefik.http.services.n8n.loadbalancer.server.port=5678"
-        - "traefik.http.routers.n8n.middlewares=security-headers@file,compress@file"
+        - "traefik.docker.network=n8n-network"
+        # Main Router - catches everything
+        - "traefik.http.routers.n8n-main.rule=Host(`n8n.agentshq.net`)"
+        - "traefik.http.routers.n8n-main.entrypoints=websecure"
+        - "traefik.http.routers.n8n-main.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.n8n-main.service=n8n-webhook"
+        # API Router
+        - "traefik.http.routers.n8n-api.rule=Host(`n8n.agentshq.net`) && PathPrefix(`/api`)"
+        - "traefik.http.routers.n8n-api.entrypoints=websecure"
+        - "traefik.http.routers.n8n-api.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.n8n-api.service=n8n-webhook"
+        # Webhook Router  
+        - "traefik.http.routers.n8n-webhooks.rule=Host(`n8n.agentshq.net`) && PathPrefix(`/webhook`)"
+        - "traefik.http.routers.n8n-webhooks.entrypoints=websecure"
+        - "traefik.http.routers.n8n-webhooks.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.n8n-webhooks.service=n8n-webhook"
+        # Service definition
+        - "traefik.http.services.n8n-webhook.loadbalancer.server.port=5678"
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
@@ -177,11 +195,6 @@ services:
       start_period: 60s
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "10"
 
   n8n-mcp:
     image: docker.n8n.io/n8nio/n8n:latest
@@ -189,13 +202,13 @@ services:
       replicas: 1
       labels:
         - "traefik.enable=true"
-        - "traefik.docker.network=n8n_n8n-network"
-        - "traefik.http.routers.n8n-mcp.rule=Host(`${N8N_HOST}`) && PathPrefix(`/mcp`)"
+        - "traefik.docker.network=n8n-network"
+        - "traefik.http.routers.n8n-mcp.rule=Host(`n8n.agentshq.net`) && PathPrefix(`/mcp`)"
         - "traefik.http.routers.n8n-mcp.entrypoints=websecure"
         - "traefik.http.routers.n8n-mcp.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.n8n-mcp.service=n8n-mcp"
         - "traefik.http.routers.n8n-mcp.priority=100"
         - "traefik.http.services.n8n-mcp.loadbalancer.server.port=5678"
-        - "traefik.http.routers.n8n-mcp.middlewares=mcp-sse@file"
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
@@ -238,11 +251,7 @@ services:
       start_period: 60s
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "10"
+
   n8n-worker:
     image: docker.n8n.io/n8nio/n8n:latest
     deploy:
@@ -290,11 +299,6 @@ services:
       start_period: 60s
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "10"
 
   prometheus:
     image: prom/prometheus:latest
@@ -312,11 +316,6 @@ services:
       - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
 
   grafana:
     image: grafana/grafana:latest
@@ -324,7 +323,8 @@ services:
       replicas: 1
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.grafana.rule=Host(`grafana.${N8N_HOST}`)"
+        - "traefik.docker.network=n8n-network"
+        - "traefik.http.routers.grafana.rule=Host(`grafana.agentshq.net`)"
         - "traefik.http.routers.grafana.entrypoints=websecure"
         - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
         - "traefik.http.services.grafana.loadbalancer.server.port=3000"
@@ -337,11 +337,6 @@ services:
       - grafana_data:/var/lib/grafana
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
 
   alertmanager:
     image: prom/alertmanager:latest
@@ -357,8 +352,3 @@ services:
       - ./config/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     networks:
       - n8n-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "30m"
-        max-file: "3"
