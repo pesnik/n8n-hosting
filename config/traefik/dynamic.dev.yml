@@ -1,117 +1,414 @@
+# ============================================================================
+# Traefik Dynamic Configuration - Production Grade for n8n + MCP
+# Based on: https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-langchain.mcptrigger/
+# This file is mounted to /etc/traefik/dynamic.yml
+# ============================================================================
+
 http:
+  # ==========================================================================
+  # Middlewares
+  # ==========================================================================
   middlewares:
-    https-redirect:
-      redirectScheme:
-        scheme: https
-        permanent: true
-    compress:
+    # ------------------------------------------------------------------------
+    # MCP-Specific Middleware Chain - CRITICAL for SSE/Streamable HTTP
+    # ------------------------------------------------------------------------
+    mcp-sse:
+      chain:
+        middlewares:
+          - mcp-no-buffer
+          - mcp-no-compress
+          - mcp-headers
+    
+    # Disable buffering completely for MCP
+    mcp-no-buffer:
+      buffering:
+        maxRequestBodyBytes: 0
+        maxResponseBodyBytes: 0
+        memRequestBodyBytes: 0
+        memResponseBodyBytes: 0
+        retryExpression: "false"  # Don't retry SSE connections
+    
+    # Disable compression for MCP (breaks SSE)
+    mcp-no-compress:
       compress:
         excludedContentTypes:
-          - text/event-stream
-          - application/grpc
+          - "*/*"  # Exclude everything
+    
+    # Special headers for MCP streaming
+    mcp-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+          Connection: ""  # Remove Connection header (nginx pattern)
+          X-Accel-Buffering: "no"  # Disable nginx buffering if behind another proxy
+        customResponseHeaders:
+          Cache-Control: "no-cache, no-store, must-revalidate"
+          X-Accel-Buffering: "no"
+          X-Content-Type-Options: "nosniff"
+        # DO NOT set: Content-Encoding, Transfer-Encoding, or any compression headers
+    
+    # ------------------------------------------------------------------------
+    # Standard Security Headers (for non-MCP routes)
+    # ------------------------------------------------------------------------
     security-headers:
       headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
         customResponseHeaders:
           X-Content-Type-Options: "nosniff"
           X-Frame-Options: "SAMEORIGIN"
           X-XSS-Protection: "1; mode=block"
           Referrer-Policy: "strict-origin-when-cross-origin"
-        customRequestHeaders:
-          X-Forwarded-Proto: "https"
-    n8n-rate-limit:
+          Strict-Transport-Security: "max-age=31536000; includeSubDomains; preload"
+          Permissions-Policy: "geolocation=(), microphone=(), camera=()"
+        sslRedirect: true
+        sslForceHost: true
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+    
+    # ------------------------------------------------------------------------
+    # Compression (excludes streaming content types)
+    # ------------------------------------------------------------------------
+    compress:
+      compress:
+        excludedContentTypes:
+          - text/event-stream
+          - application/grpc
+          - application/json+sse
+          - application/x-ndjson
+        minResponseBodyBytes: 1024
+    
+    # ------------------------------------------------------------------------
+    # Rate Limiting (protects against abuse)
+    # ------------------------------------------------------------------------
+    rate-limit-strict:
       rateLimit:
         average: 100
-        period: 60s
+        period: 1m
         burst: 50
+        sourceCriterion:
+          requestHost: true
+          ipStrategy:
+            depth: 1
+    
+    rate-limit-api:
+      rateLimit:
+        average: 200
+        period: 1m
+        burst: 100
+        sourceCriterion:
+          requestHost: true
+    
+    # ------------------------------------------------------------------------
+    # Error Pages (optional - customize error responses)
+    # ------------------------------------------------------------------------
+    error-pages:
+      errors:
+        status:
+          - "500-599"
+        service: n8n-webhook
+        query: "/error/{status}"
+    
+    # ------------------------------------------------------------------------
+    # IP Whitelist (optional - restrict access to specific IPs)
+    # ------------------------------------------------------------------------
+    # ip-whitelist:
+    #   ipWhiteList:
+    #     sourceRange:
+    #       - "127.0.0.1/32"
+    #       - "YOUR_IP_RANGE/32"
 
+  # ==========================================================================
+  # Routers - Define routing rules with priorities
+  # ==========================================================================
   routers:
-    n8n-main:
-      rule: "Host(`n8n.agentshq.net`)"
-      service: n8n-main
-      entrypoints:
-        - n8n
+    # ------------------------------------------------------------------------
+    # MCP Route - HIGHEST PRIORITY (must match first)
+    # Routes: /mcp/* → n8n-mcp service (single replica)
+    # ------------------------------------------------------------------------
+    n8n-mcp:
+      rule: "Host(`n8n.agentshq.net`) && PathPrefix(`/mcp`)"
+      service: n8n-mcp
+      entryPoints:
+        - websecure
+      priority: 100  # Highest priority
       middlewares:
-        - security-headers
-        - compress
+        - mcp-sse  # Critical: No buffering, no compression
       tls:
-        options: default
-
+        certResolver: letsencrypt
+        domains:
+          - main: "n8n.agentshq.net"
+    
+    # ------------------------------------------------------------------------
+    # n8n API Route - HIGH PRIORITY
+    # Routes: /api/* → n8n-webhook service
+    # ------------------------------------------------------------------------
     n8n-api:
       rule: "Host(`n8n.agentshq.net`) && PathPrefix(`/api`)"
-      service: n8n-main
-      entrypoints:
-        - n8n
+      service: n8n-webhook
+      entryPoints:
+        - websecure
+      priority: 50
       middlewares:
         - security-headers
-        - n8n-rate-limit
+        - rate-limit-api
         - compress
       tls:
-        options: default
-
+        certResolver: letsencrypt
+    
+    # ------------------------------------------------------------------------
+    # n8n Webhook Route - HIGH PRIORITY
+    # Routes: /webhook/* → n8n-webhook service
+    # ------------------------------------------------------------------------
     n8n-webhooks:
       rule: "Host(`n8n.agentshq.net`) && PathPrefix(`/webhook`)"
-      service: n8n-main
-      entrypoints:
-        - n8n
+      service: n8n-webhook
+      entryPoints:
+        - websecure
+      priority: 50
       middlewares:
         - security-headers
         - compress
       tls:
-        options: default
-
+        certResolver: letsencrypt
+    
+    # ------------------------------------------------------------------------
+    # n8n Main Route - DEFAULT PRIORITY
+    # Routes: /* → n8n-webhook service (UI, editor)
+    # ------------------------------------------------------------------------
+    n8n-main:
+      rule: "Host(`n8n.agentshq.net`)"
+      service: n8n-webhook
+      entryPoints:
+        - websecure
+      priority: 10  # Lower priority (catches everything else)
+      middlewares:
+        - security-headers
+        - compress
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "n8n.agentshq.net"
+    
+    # ------------------------------------------------------------------------
+    # HTTP to HTTPS Redirect (port 80 → 443)
+    # ------------------------------------------------------------------------
+    n8n-http-redirect:
+      rule: "Host(`n8n.agentshq.net`)"
+      service: n8n-webhook
+      entryPoints:
+        - web
+      priority: 1
+      middlewares:
+        - https-redirect
+    
+    # ------------------------------------------------------------------------
+    # Grafana Route
+    # Routes: grafana.agentshq.net → grafana service
+    # ------------------------------------------------------------------------
     grafana:
-      rule: "Host(`n8n.agentshq.net`)"
+      rule: "Host(`grafana.agentshq.net`)"
       service: grafana
-      entrypoints:
-        - grafana
+      entryPoints:
+        - websecure
       middlewares:
         - security-headers
         - compress
       tls:
-        options: default
-
-    prometheus:
-      rule: "Host(`n8n.agentshq.net`)"
-      service: prometheus
-      entrypoints:
+        certResolver: letsencrypt
+        domains:
+          - main: "grafana.agentshq.net"
+    
+    grafana-http-redirect:
+      rule: "Host(`grafana.agentshq.net`)"
+      service: grafana
+      entryPoints:
         - web
       middlewares:
-        - security-headers
+        - https-redirect
+    
+    # ------------------------------------------------------------------------
+    # Prometheus Route (optional - expose via subdomain)
+    # ------------------------------------------------------------------------
+    # prometheus:
+    #   rule: "Host(`prometheus.agentshq.net`)"
+    #   service: prometheus
+    #   entryPoints:
+    #     - websecure
+    #   middlewares:
+    #     - security-headers
+    #     - ip-whitelist  # Restrict access
+    #   tls:
+    #     certResolver: letsencrypt
+    
+    # ------------------------------------------------------------------------
+    # Traefik Dashboard Route (optional - secure it!)
+    # ------------------------------------------------------------------------
+    # dashboard:
+    #   rule: "Host(`traefik.agentshq.net`)"
+    #   service: api@internal
+    #   entryPoints:
+    #     - websecure
+    #   middlewares:
+    #     - security-headers
+    #     - ip-whitelist  # MUST restrict access
+    #   tls:
+    #     certResolver: letsencrypt
 
+  # ==========================================================================
+  # Services - Backend service configurations
+  # ==========================================================================
   services:
-    n8n-main:
+    # ------------------------------------------------------------------------
+    # n8n Webhook Handler (main UI, webhooks, API)
+    # ------------------------------------------------------------------------
+    n8n-webhook:
       loadBalancer:
         servers:
-          - url: "http://n8n-main:5678"
+          - url: "http://n8n-webhook:5678"
         sticky:
           cookie:
             name: n8n-session
             secure: true
             httpOnly: true
-            sameSite: "Strict"
-
+            sameSite: lax
+        passHostHeader: true
+        healthCheck:
+          path: /healthz
+          interval: 30s
+          timeout: 10s
+          scheme: http
+    
+    # ------------------------------------------------------------------------
+    # n8n MCP Handler (dedicated for SSE persistence)
+    # CRITICAL: Single replica only, fast flush for streaming
+    # ------------------------------------------------------------------------
+    n8n-mcp:
+      loadBalancer:
+        servers:
+          - url: "http://n8n-mcp:5678"
+        passHostHeader: true
+        # CRITICAL: Fast response forwarding for SSE
+        responseForwarding:
+          flushInterval: "1ms"
+        healthCheck:
+          path: /healthz
+          interval: 30s
+          timeout: 10s
+          scheme: http
+    
+    # ------------------------------------------------------------------------
+    # Grafana Service
+    # ------------------------------------------------------------------------
     grafana:
       loadBalancer:
         servers:
           - url: "http://grafana:3000"
-
+        passHostHeader: true
+        healthCheck:
+          path: /api/health
+          interval: 30s
+          timeout: 5s
+          scheme: http
+    
+    # ------------------------------------------------------------------------
+    # Prometheus Service
+    # ------------------------------------------------------------------------
     prometheus:
       loadBalancer:
         servers:
-          - url: "http://prometheus:9490"
+          - url: "http://prometheus:9090"
+        passHostHeader: true
+        healthCheck:
+          path: /-/healthy
+          interval: 30s
+          timeout: 5s
+          scheme: http
 
+  # ==========================================================================
+  # Middleware Definitions (additional helpers)
+  # ==========================================================================
+  middlewares:
+    # HTTPS redirect middleware
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+        port: "443"
+    
+    # Strip prefix middleware (if needed for sub-paths)
+    strip-mcp-prefix:
+      stripPrefix:
+        prefixes:
+          - "/mcp"
+    
+    # Custom error page middleware
+    custom-errors:
+      errors:
+        status:
+          - "404"
+          - "500-599"
+        service: n8n-webhook
+        query: "/error/{status}"
+
+# ============================================================================
+# TLS Configuration
+# ============================================================================
 tls:
   options:
+    # Default TLS options (applied to all routes unless overridden)
     default:
-      minVersion: "VersionTLS12"
+      minVersion: VersionTLS12
+      maxVersion: VersionTLS13
       cipherSuites:
-        - "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
-        - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
-        - "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+        # TLS 1.3 cipher suites (automatically used when available)
+        # TLS 1.2 cipher suites
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+      curvePreferences:
+        - CurveP521
+        - CurveP384
+        - X25519
       sniStrict: true
+      alpnProtocols:
+        - h2
+        - http/1.1
+    
+    # Strict TLS options (for sensitive routes)
+    strict:
+      minVersion: VersionTLS13
+      maxVersion: VersionTLS13
+      sniStrict: true
+      alpnProtocols:
+        - h2
 
-  certificates:
-    - certFile: /etc/traefik/certs/wildcard_agentshq_net.crt
-      keyFile: /etc/traefik/certs/wildcard_agentshq_net.key
-      stores:
-        default: {}
+  # Manual certificate configuration (if not using Let's Encrypt)
+  # certificates:
+  #   - certFile: /etc/traefik/certs/agentshq.net.crt
+  #     keyFile: /etc/traefik/certs/agentshq.net.key
+  #     stores:
+  #       - default
+
+# ============================================================================
+# TCP/UDP Configuration (if needed for non-HTTP services)
+# ============================================================================
+# tcp:
+#   routers:
+#     postgres:
+#       rule: "HostSNI(`*`)"
+#       service: postgres
+#       entryPoints:
+#         - postgres
+#   services:
+#     postgres:
+#       loadBalancer:
+#         servers:
+#           - address: "postgres:5432"

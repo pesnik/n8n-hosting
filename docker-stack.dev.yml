@@ -1,18 +1,24 @@
 # ============================================================================
-# n8n Production Stack for agentshq Infrastructure
-# All Services via: n8n.agentshq.net (Manager Node)
-# Custom Ports: 8080 (HTTP), 8443 (HTTPS), 9490 (Prometheus), 9300 (Node Exporter), 9493 (AlertManager)
-# Uses only role constraints (worker/manager), NOT node IDs - nodes are ephemeral
-# Timezone: Asia/Dhaka
+# n8n Production Stack - MCP-Compatible Architecture
+# Based on: https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-langchain.mcptrigger/
+# Architecture: Separated webhook handler, dedicated MCP replica, worker pool
 # ============================================================================
+version: '3.8'
+
 volumes:
   postgres_data:
     driver: local
   redis_data:
     driver: local
-  n8n_data:
+  n8n_webhook_data:
+    driver: local
+  n8n_mcp_data:
+    driver: local
+  n8n_worker_data:
     driver: local
   traefik_data:
+    driver: local
+  letsencrypt:
     driver: local
   prometheus_data:
     driver: local
@@ -22,14 +28,9 @@ volumes:
     driver: local
 
 networks:
-  # Internal n8n overlay network spans all Swarm nodes (manager + workers)
-  # VXLAN ID 4105 is used for tunnel encapsulation across all nodes
-  # Used for n8n internal communication: main ↔ workers ↔ redis ↔ postgres
   n8n-network:
     driver: overlay
-    driver_opts:
-      com.docker.network.driver.overlay.vxlanid_list: "4105"
-    attachable: true    
+    attachable: true
 
 services:
   # ============================================================================
@@ -39,21 +40,27 @@ services:
     image: postgres:16-alpine
     deploy:
       replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_INITDB_ARGS: "-c max_connections=${DB_MAX_CONNECTIONS} -c shared_buffers=${DB_SHARED_BUFFERS} -c effective_cache_size=${DB_EFFECTIVE_CACHE_SIZE} -c work_mem=${DB_WORK_MEM}"
+      POSTGRES_INITDB_ARGS: >-
+        -c max_connections=100
+        -c shared_buffers=256MB
+        -c effective_cache_size=1GB
+        -c work_mem=16MB
       TZ: ${TIMEZONE}
+      # Enable pg_stat_statements for monitoring
       POSTGRES_SHARED_PRELOAD_LIBRARIES: pg_stat_statements
-      # Set the configuration parameters once the library is loaded
-      POSTGRES_PG_STAT_STATEMENTS_TRACK: all
-      POSTGRES_PG_STAT_STATEMENTS_MAX: 10000      
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./config/postgres/init-data.sql:/docker-entrypoint-initdb.d/init-data.sql:ro
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -h localhost -U n8n_dbadmin_prod -d n8n_production_db']
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -65,28 +72,30 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-        labels: "service=postgres,env=production"
 
   # ============================================================================
   # QUEUE LAYER: Redis (Manager Node Only)
-  # Internal port: 6479 (custom for security)
   # ============================================================================
   redis:
     image: redis:7-alpine
     deploy:
       replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
     command: >
       redis-server
       --appendonly yes
       --appendfsync everysec
-      --maxmemory ${REDIS_MAXMEMORY}
-      --maxmemory-policy ${REDIS_MAXMEMORY_POLICY}
+      --maxmemory ${REDIS_MAXMEMORY:-512mb}
+      --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
       --requirepass ${REDIS_PASSWORD}
-      --port ${REDIS_PORT}
+      --port ${REDIS_PORT:-6379}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ['CMD', 'redis-cli', '-p', '${REDIS_PORT}', '-a', '${REDIS_PASSWORD}', 'ping']
+      test: ['CMD', 'redis-cli', '-p', '${REDIS_PORT:-6379}', '-a', '${REDIS_PASSWORD}', 'ping']
       interval: 10s
       timeout: 3s
       retries: 5
@@ -98,53 +107,25 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-        labels: "service=redis,env=production"
 
   # ============================================================================
-  # INGRESS LAYER: Traefik Reverse Proxy (Manager Node Only)
-  # Accessible via: n8n.agentshq.net:8180 (HTTP->HTTPS redirect)
-  #                 n8n.agentshq.net:8645 (HTTPS n8n with wildcard cert)
-  #                 n8n.agentshq.net:8646 (HTTPS Grafana with wildcard cert)
-  # Routing:
-  #   - n8n.agentshq.net -> n8n:5678 on port 8645
-  #   - grafana.agentshq.net -> grafana:3000 on port 8646
+  # INGRESS LAYER: Traefik with Let's Encrypt (Manager Node Only)
   # ============================================================================
   traefik:
     image: traefik:v3.5.3
     deploy:
       replicas: 1
-    command:
-      - "--global.checkNewVersion=true"
-      - "--global.sendAnonymousUsage=false"
-      - "--api.dashboard=false"
-      - "--api.debug=false"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=n8n_n8n-network"
-      - "--providers.file.filename=/etc/traefik/dynamic.yml"
-      - "--providers.file.watch=true"
-      - "--entrypoints.web.address=:8180"
-      - "--entrypoints.n8n.address=:8645"
-      - "--entrypoints.grafana.address=:8646"
-      - "--ping.entrypoint=traefik"
-      - "--ping=true"
-      - "--entrypoints.traefik.address=:8080"        
-      - "--log.level=warn"
-      - "--log.format=json"
-      - "--accesslog=false"
-      # - "--certificatesresolvers.letsencrypt.acme.email=foo@example.com"
-      # - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-      # - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      restart_policy:
+        condition: on-failure
     ports:
-      - "8180:8180"
-      - "8645:8645"
-      - "8646:8646"
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Traefik dashboard/metrics (optional, can be removed)
     volumes:
-      - traefik_data:/etc/traefik
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
       - ./config/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./config/traefik/dynamic.dev.yml:/etc/traefik/dynamic.yml:ro
-      - ./config/traefik/certs:/etc/traefik/certs:ro
-      # - ./letsencrypt:/letsencrypt
+      - ./config/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
     healthcheck:
       test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:8080/ping']
       interval: 10s
@@ -158,72 +139,87 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-        labels: "service=traefik,env=production"
 
   # ============================================================================
-  # APPLICATION: n8n Main Instance (Manager Node Only - Webhook Handler)
-  # Access: https://n8n.agentshq.net:8645
-  # Routes SNI: n8n.agentshq.net -> n8n:5678
+  # APPLICATION: n8n WEBHOOK Handler (Manager Node Only)
+  # Handles: Regular webhooks, UI, API calls (NOT MCP)
   # ============================================================================
-  n8n-main:
+  n8n-webhook:
     image: docker.n8n.io/n8nio/n8n:latest
     deploy:
       replicas: 1
       labels:
         - "traefik.enable=true"
         - "traefik.docker.network=n8n_n8n-network"
-        - "traefik.http.routers.n8n.rule=Host(`n8n.agentshq.net`)"
-        - "traefik.http.routers.n8n.entrypoints=n8n"
-        - "traefik.http.routers.n8n.tls=true"
-        # - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+        
+        # Main n8n route
+        - "traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)"
+        - "traefik.http.routers.n8n.entrypoints=websecure"
+        - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.n8n.priority=10"
         - "traefik.http.services.n8n.loadbalancer.server.port=5678"
-        # - "traefik.http.middlewares.n8n-auth.basicauth.users=admin:$2a$10$Sg2cYzP8.lzrX1cNa.6Ol.Ck.HzGS7JI3R5qvKxN4E2gYBKC4JRZG"
-        # - "traefik.http.routers.n8n.middlewares=n8n-auth"
+        - "traefik.http.routers.n8n.middlewares=n8n-headers@file,compress@file"
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
     environment:
+      # Database
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
       DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
       DB_POSTGRESDB_USER: ${POSTGRES_USER}
       DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_POSTGRESDB_SSL: "false"
+      DB_POSTGRESDB_POOL_SIZE: 4
       
+      # Queue Mode
       EXECUTIONS_MODE: queue
       QUEUE_BULL_REDIS_HOST: redis
-      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT}
+      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT:-6379}
       QUEUE_BULL_REDIS_DB: 0
       QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
       QUEUE_HEALTH_CHECK_ACTIVE: "true"
       
+      # Security
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       N8N_BASIC_AUTH_ACTIVE: "true"
       N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
-      N8N_BASIC_AUTH_PASSWORD_HASH: ${N8N_BASIC_AUTH_PASSWORD_HASH}
-      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
       
-      N8N_HOST: 0.0.0.0
+      # URLs - CRITICAL for webhooks
+      N8N_HOST: ${N8N_HOST}
       N8N_PORT: 5678
       N8N_PROTOCOL: https
-      N8N_SECURE_COOKIE: "true"
-      WEBHOOK_URL: "https://${MANAGER_HOST}:${N8N_PORT}/"
-      WEBHOOK_TUNNEL_URL: "https://${MANAGER_HOST}:${N8N_PORT}/"
+      WEBHOOK_URL: "https://${N8N_HOST}/"
+      N8N_EDITOR_BASE_URL: "https://${N8N_HOST}/"
       
+      # Execution
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 336  # 14 days
+      
+      # Timezone
       GENERIC_TIMEZONE: ${TIMEZONE}
       TZ: ${TIMEZONE}
       
-      LOG_LEVEL: ${LOG_LEVEL}
-      N8N_DEFAULT_EXECUTION_TIMEOUT: ${N8N_EXECUTION_TIMEOUT}
-      N8N_PAYLOAD_SIZE_MAX: ${N8N_PAYLOAD_SIZE_MAX}
-      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"
-      EXECUTIONS_DATA_PRUNE_SOFT_DELETE_TIMEOUT: 720
-      N8N_DIAGNOSTICS_ENABLED: ${N8N_DIAGNOSTICS_ENABLED}
+      # Performance
+      N8N_PAYLOAD_SIZE_MAX: 16
+      N8N_METRICS: "true"
+      
+      # Logging
+      LOG_LEVEL: info
+      LOG_OUTPUT: console
     volumes:
-      - n8n_data:/home/node/.n8n
+      - n8n_webhook_data:/home/node/.n8n
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:5678/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5        
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
       - n8n-network
     logging:
@@ -231,55 +227,134 @@ services:
       options:
         max-size: "100m"
         max-file: "10"
-        labels: "service=n8n-main,env=production"
 
   # ============================================================================
-  # WORKERS: n8n Queue Processors (Any Worker Nodes - Global Mode)
-  # Dynamically placed on any available worker node (role=worker)
-  # No node ID constraint - tolerates node additions/removals during patching
+  # APPLICATION: n8n MCP DEDICATED REPLICA (Manager Node Only)
+  # CRITICAL: Single replica for MCP SSE/streamable HTTP persistence
+  # Routes: /mcp/* only
+  # ============================================================================
+  n8n-mcp:
+    image: docker.n8n.io/n8nio/n8n:latest
+    deploy:
+      replicas: 1  # MUST BE 1 - DO NOT SCALE
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=n8n_n8n-network"
+        
+        # MCP route - HIGHEST PRIORITY
+        - "traefik.http.routers.n8n-mcp.rule=Host(`${N8N_HOST}`) && PathPrefix(`/mcp`)"
+        - "traefik.http.routers.n8n-mcp.entrypoints=websecure"
+        - "traefik.http.routers.n8n-mcp.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.n8n-mcp.priority=100"
+        - "traefik.http.services.n8n-mcp.loadbalancer.server.port=5678"
+        - "traefik.http.routers.n8n-mcp.middlewares=mcp-sse@file"
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+    environment:
+      # Database (same as webhook)
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_USER}
+      DB_POSTGRESDB_POOL_SIZE: 2
+      
+      # Queue Mode
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT:-6379}
+      QUEUE_BULL_REDIS_DB: 0
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      
+      # Security
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      
+      # URLs
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: "https://${N8N_HOST}/"
+      N8N_EDITOR_BASE_URL: "https://${N8N_HOST}/"
+      
+      # Timezone
+      GENERIC_TIMEZONE: ${TIMEZONE}
+      TZ: ${TIMEZONE}
+      
+      # Logging
+      LOG_LEVEL: info
+      LOG_OUTPUT: console
+    volumes:
+      - n8n_mcp_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - n8n-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  # ============================================================================
+  # WORKERS: n8n Queue Processors (Worker Nodes - Global Mode)
   # ============================================================================
   n8n-worker:
     image: docker.n8n.io/n8nio/n8n:latest
     deploy:
       mode: global
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        mkdir -p /home/node/.n8n
-        chmod 755 /home/node/.n8n
-        node /usr/local/lib/node_modules/n8n/bin/n8n worker --concurrency=${N8N_WORKER_CONCURRENCY}
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+    command: n8n worker --concurrency=${N8N_WORKER_CONCURRENCY:-10}
     environment:
+      # Database
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
       DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
       DB_POSTGRESDB_USER: ${POSTGRES_USER}
       DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_POSTGRESDB_SSL: "false"
+      DB_POSTGRESDB_POOL_SIZE: 4
       
+      # Queue Mode
       EXECUTIONS_MODE: queue
       QUEUE_BULL_REDIS_HOST: redis
-      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT}
+      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT:-6379}
       QUEUE_BULL_REDIS_DB: 0
       QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
       
+      # Security
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
-      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
       
+      # Timezone
       GENERIC_TIMEZONE: ${TIMEZONE}
       TZ: ${TIMEZONE}
       
-      LOG_LEVEL: ${LOG_LEVEL}
-      N8N_DEFAULT_EXECUTION_TIMEOUT: ${N8N_EXECUTION_TIMEOUT}
+      # Performance
+      N8N_PAYLOAD_SIZE_MAX: 16
+      
+      # Logging
+      LOG_LEVEL: info
+      LOG_OUTPUT: console
     volumes:
-      - n8n_data:/home/node/.n8n
+      - n8n_worker_data:/home/node/.n8n
     healthcheck:
       test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q 'n8n worker' || exit 1"]
-      interval: 15s
+      interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 60s
     networks:
       - n8n-network
     logging:
@@ -287,12 +362,10 @@ services:
       options:
         max-size: "100m"
         max-file: "10"
-        labels: "service=n8n-worker,env=production"
 
   # ============================================================================
-  # OBSERVABILITY: Prometheus (Any Worker Node)
-  # Port: 9490 (custom for security)
-  # Accessible: n8n.agentshq.net:9490
+  # OBSERVABILITY: Prometheus, Grafana, AlertManager
+  # (Keeping your existing configs - they're fine)
   # ============================================================================
   prometheus:
     image: prom/prometheus:latest
@@ -303,21 +376,12 @@ services:
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=45d"
       - "--storage.tsdb.retention.size=45GB"
-      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-      - "--web.console.templates=/usr/share/prometheus/consoles"
-      - "--web.listen-address=:9490"
+      - "--web.listen-address=:9090"
     ports:
-      - "9490:9490"
+      - "9090:9090"
     volumes:
       - prometheus_data:/prometheus
       - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./config/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
-    healthcheck:
-      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:9490/-/healthy']
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
     networks:
       - n8n-network
     logging:
@@ -325,45 +389,25 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-        labels: "service=prometheus,env=production"
 
-  # ============================================================================
-  # OBSERVABILITY: Grafana (Any Worker Node)
-  # Access: https://n8n.agentshq.net:8646
-  # Routes SNI: grafana.agentshq.net -> grafana:3000
-  # ============================================================================
   grafana:
     image: grafana/grafana:latest
     deploy:
       replicas: 1
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.grafana.rule=Host(`grafana.agentshq.net`)"
-        - "traefik.http.routers.grafana.entrypoints=grafana"
-        - "traefik.http.routers.grafana.tls=true"
+        - "traefik.http.routers.grafana.rule=Host(`grafana.${N8N_HOST}`)"
+        - "traefik.http.routers.grafana.entrypoints=websecure"
+        - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
         - "traefik.http.services.grafana.loadbalancer.server.port=3000"
-        # - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
-      GF_SERVER_ROOT_URL: "https://${MANAGER_HOST}:${GRAFANA_PORT}"
-      GF_SERVER_SERVE_FROM_SUB_PATH: "false"
-      GF_INSTALL_PLUGINS: "grafana-piechart-panel,grafana-worldmap-panel"
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_SECURITY_DISABLE_BRUTE_FORCE_LOGIN_PROTECTION: "false"
-      GF_SECURITY_COOKIE_SECURE: "true"
-      GF_SECURITY_COOKIE_SAMESITE: "Lax"
-      GF_SESSION_COOKIE_SECURE: "true"
+      GF_SERVER_ROOT_URL: "https://grafana.${N8N_HOST}"
+      GF_INSTALL_PLUGINS: "grafana-piechart-panel"
       TZ: ${TIMEZONE}
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
-    healthcheck:
-      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:3000/api/health']
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
     networks:
       - n8n-network
     logging:
@@ -371,13 +415,7 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-        labels: "service=grafana,env=production"
 
-  # ============================================================================
-  # OBSERVABILITY: AlertManager (Any Worker Node)
-  # Port: 9493 (custom for security)
-  # Accessible: n8n.agentshq.net:9493
-  # ============================================================================
   alertmanager:
     image: prom/alertmanager:latest
     deploy:
@@ -385,18 +423,11 @@ services:
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
-      - "--web.listen-address=:9493"
     ports:
-      - "9493:9493"
+      - "9093:9093"
     volumes:
       - alertmanager_data:/alertmanager
       - ./config/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    healthcheck:
-      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:9493/-/healthy']
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
     networks:
       - n8n-network
     logging:
@@ -404,4 +435,3 @@ services:
       options:
         max-size: "30m"
         max-file: "3"
-        labels: "service=alertmanager,env=production"

@@ -1,48 +1,180 @@
-# Traefik static configuration
+# ============================================================================
+# Traefik Static Configuration (v3.5.3)
+# This file is mounted to /etc/traefik/traefik.yml
+# ============================================================================
+
 global:
   checkNewVersion: true
   sendAnonymousUsage: false
 
+# ============================================================================
+# API and Dashboard
+# ============================================================================
 api:
-  dashboard: false
+  dashboard: true
+  insecure: false  # Dashboard only via secure entrypoints
   debug: false
 
+# ============================================================================
+# Logging
+# ============================================================================
+log:
+  level: INFO  # DEBUG, INFO, WARN, ERROR
+  format: json
+  filePath: /var/log/traefik/traefik.log
+
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  bufferingSize: 100
+  filters:
+    statusCodes:
+      - "400-599"  # Only log errors
+    retryAttempts: true
+    minDuration: "10ms"
+
+# ============================================================================
+# Entrypoints
+# ============================================================================
+entryPoints:
+  # HTTP entrypoint (port 80) - redirects to HTTPS
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+    # Trust proxy headers
+    forwardedHeaders:
+      trustedIPs:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+    transport:
+      lifeCycle:
+        requestAcceptGraceTimeout: 5s
+        graceTimeOut: 10s
+      respondingTimeouts:
+        readTimeout: 60s
+        writeTimeout: 60s
+        idleTimeout: 180s
+
+  # HTTPS entrypoint (port 443)
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "agentshq.net"
+            sans:
+              - "*.agentshq.net"
+      # Middleware applied globally (can be overridden per route)
+      middlewares:
+        - security-headers@file
+    forwardedHeaders:
+      trustedIPs:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+    transport:
+      lifeCycle:
+        requestAcceptGraceTimeout: 5s
+        graceTimeOut: 10s
+      respondingTimeouts:
+        readTimeout: 0  # No timeout for SSE/MCP
+        writeTimeout: 0  # No timeout for SSE/MCP
+        idleTimeout: 300s  # 5 minutes idle before closing
+
+  # Traefik internal entrypoint for health checks
+  traefik:
+    address: ":8080"
+
+# ============================================================================
+# Certificate Resolvers (Let's Encrypt)
+# ============================================================================
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: pesnik@outlook.com
+      storage: /letsencrypt/acme.json
+      # Uncomment for testing with staging server (rate limits are higher)
+      # caServer: "https://acme-staging-v02.api.letsencrypt.org/directory"
+      
+      # TLS Challenge (recommended for Swarm)
+      tlsChallenge: {}
+      
+      # HTTP Challenge (alternative if TLS challenge fails)
+      # httpChallenge:
+      #   entryPoint: web
+
+# ============================================================================
+# Providers
+# ============================================================================
 providers:
+  # Docker Swarm provider
   docker:
     endpoint: "unix:///var/run/docker.sock"
+    watch: true
     exposedByDefault: false
     network: "n8n_n8n-network"
+    swarmMode: true
+    swarmModeRefreshSeconds: 15
+    defaultRule: "Host(`{{ normalize .Name }}.agentshq.net`)"
+    constraints: ""
+
+  # File provider for dynamic configuration
   file:
     filename: /etc/traefik/dynamic.yml
     watch: true
 
-entrypoints:
-  web:
-    address: ":8280"
-  n8n:
-    address: ":8645"
-    http:
-      tls:
-        certResolver: "local"
-        options: "default"
-  grafana:
-    address: ":8646"
-    http:
-      tls:
-        certResolver: "local"
-        options: "default"
+# ============================================================================
+# Metrics (for Prometheus)
+# ============================================================================
+metrics:
+  prometheus:
+    entryPoint: traefik
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+    buckets:
+      - 0.1
+      - 0.3
+      - 1.0
+      - 3.0
+      - 10.0
 
+# ============================================================================
+# Ping (Health Check)
+# ============================================================================
 ping:
-  entryPoint: "traefik"        
+  entryPoint: traefik
 
-certificatesResolvers:
-  local:
-    acme:
-      storage: /etc/traefik/acme.json
+# ============================================================================
+# Tracing (Optional - useful for debugging)
+# ============================================================================
+# tracing:
+#   jaeger:
+#     samplingServerURL: http://jaeger:5778/sampling
+#     localAgentHostPort: jaeger:6831
 
-log:
-  level: info
-  format: json
+# ============================================================================
+# Server Transport (Global Settings)
+# ============================================================================
+serversTransport:
+  insecureSkipVerify: false  # NEVER skip TLS verification in production
+  rootCAs:
+    - /etc/ssl/certs/ca-certificates.crt
+  maxIdleConnsPerHost: 200
+  forwardingTimeouts:
+    dialTimeout: 30s
+    responseHeaderTimeout: 0  # No timeout for streaming
+    idleConnTimeout: 90s
 
-accessLog:
-  format: json
+# ============================================================================
+# Experimental Features
+# ============================================================================
+experimental:
+  plugins: {}
