@@ -120,8 +120,6 @@ providers:
     watch: true
     exposedByDefault: false
     network: "n8n_n8n-network"
-    swarmMode: true
-    swarmModeRefreshSeconds: 15
     defaultRule: "Host(`{{ normalize .Name }}.agentshq.net`)"
     constraints: ""
 
@@ -176,5 +174,5 @@ serversTransport:
 # ============================================================================
 # Experimental Features
 # ============================================================================
-experimental:
-  plugins: {}
+# experimental:
+#  plugins: {}
