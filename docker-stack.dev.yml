@@ -5,56 +5,21 @@
 # Uses only role constraints (worker/manager), NOT node IDs - nodes are ephemeral
 # Timezone: Asia/Dhaka
 # ============================================================================
-
 volumes:
   postgres_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /app/n8n/volumes/postgres_data
-  
   redis_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /app/n8n/volumes/redis_data
-  
   n8n_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /app/n8n/volumes/n8n_data
-  
   traefik_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /app/n8n/volumes/traefik_data
-  
   prometheus_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /app/n8n/volumes/prometheus_data
-  
   grafana_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /app/n8n/volumes/grafana_data
-  
   alertmanager_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /app/n8n/volumes/alertmanager_data
 
 networks:
   # Internal n8n overlay network spans all Swarm nodes (manager + workers)
@@ -72,19 +37,8 @@ services:
   # ============================================================================
   postgres:
     image: postgres:16-alpine
-    restart: always
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 1G
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -119,19 +73,8 @@ services:
   # ============================================================================
   redis:
     image: redis:7-alpine
-    restart: always
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 1G
-        reservations:
-          cpus: '0.25'
-          memory: 512M
     command: >
       redis-server
       --appendonly yes
@@ -168,19 +111,8 @@ services:
   # ============================================================================
   traefik:
     image: traefik:v3.5.3
-    restart: always
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: '0.75'
-          memory: 768M
-        reservations:
-          cpus: '0.35'
-          memory: 384M
     command:
       - "--global.checkNewVersion=true"
       - "--global.sendAnonymousUsage=false"
@@ -200,17 +132,19 @@ services:
       - "--log.level=warn"
       - "--log.format=json"
       - "--accesslog=false"
+      # - "--certificatesresolvers.letsencrypt.acme.email=foo@example.com"
+      # - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      # - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
     ports:
       - "8180:8180"
       - "8645:8645"
       - "8646:8646"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - traefik_data:/etc/traefik
       - ./config/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./config/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
-      - ./config/traefik/certs/wildcard_agentshq_net.crt:/etc/traefik/certs/wildcard_agentshq_net.crt:ro
-      - ./config/traefik/certs/wildcard_agentshq_net.key:/etc/traefik/certs/wildcard_agentshq_net.key:ro
+      - ./config/traefik/dynamic.dev.yml:/etc/traefik/dynamic.yml:ro
+      - ./config/traefik/certs:/etc/traefik/certs:ro
+      # - ./letsencrypt:/letsencrypt
     healthcheck:
       test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:8080/ping']
       interval: 10s
@@ -233,25 +167,15 @@ services:
   # ============================================================================
   n8n-main:
     image: docker.n8n.io/n8nio/n8n:latest
-    restart: always
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
       labels:
         - "traefik.enable=true"
         - "traefik.docker.network=n8n_n8n-network"
         - "traefik.http.routers.n8n.rule=Host(`n8n.agentshq.net`)"
         - "traefik.http.routers.n8n.entrypoints=n8n"
         - "traefik.http.routers.n8n.tls=true"
+        # - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
         - "traefik.http.services.n8n.loadbalancer.server.port=5678"
         # - "traefik.http.middlewares.n8n-auth.basicauth.users=admin:$2a$10$Sg2cYzP8.lzrX1cNa.6Ol.Ck.HzGS7JI3R5qvKxN4E2gYBKC4JRZG"
         # - "traefik.http.routers.n8n.middlewares=n8n-auth"
@@ -316,19 +240,8 @@ services:
   # ============================================================================
   n8n-worker:
     image: docker.n8n.io/n8nio/n8n:latest
-    restart: always
     deploy:
       mode: global
-      placement:
-        constraints:
-          - node.role == worker
-      resources:
-        limits:
-          cpus: '1.5'
-          memory: 3G
-        reservations:
-          cpus: '0.75'
-          memory: 1.5G
     entrypoint: /bin/sh
     command:
       - -c
@@ -383,19 +296,8 @@ services:
   # ============================================================================
   prometheus:
     image: prom/prometheus:latest
-    restart: always
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == worker
-      resources:
-        limits:
-          cpus: '0.6'
-          memory: 1.2G
-        reservations:
-          cpus: '0.3'
-          memory: 768M
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -432,25 +334,15 @@ services:
   # ============================================================================
   grafana:
     image: grafana/grafana:latest
-    restart: always
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == worker
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 640M
-        reservations:
-          cpus: '0.25'
-          memory: 384M
       labels:
         - "traefik.enable=true"
         - "traefik.http.routers.grafana.rule=Host(`grafana.agentshq.net`)"
         - "traefik.http.routers.grafana.entrypoints=grafana"
         - "traefik.http.routers.grafana.tls=true"
         - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+        # - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
@@ -488,19 +380,8 @@ services:
   # ============================================================================
   alertmanager:
     image: prom/alertmanager:latest
-    restart: always
     deploy:
       replicas: 1
-      placement:
-        constraints:
-          - node.role == worker
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: 384M
-        reservations:
-          cpus: '0.15'
-          memory: 192M
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
