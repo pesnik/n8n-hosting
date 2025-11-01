@@ -1,64 +1,26 @@
 # ============================================================================
-# Traefik Static Configuration
+# Minimal Traefik Configuration for Testing
+# Save as: config/traefik/traefik-minimal.yml
 # ============================================================================
-
-global:
-  checkNewVersion: false
-  sendAnonymousUsage: false
 
 api:
   dashboard: true
   insecure: true
-  debug: true
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: n8n-network
 
 log:
   level: DEBUG
   format: common
 
-accessLog: {}
-
-# ============================================================================
-# Entrypoints
-# ============================================================================
-entryPoints:
-  web:
-    address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
-          permanent: true
-
-  websecure:
-    address: ":443"
-
-  traefik:
-    address: ":8080"
-
-# ============================================================================
-# Certificate Resolvers
-# ============================================================================
-certificatesResolvers:
-  letsencrypt:
-    acme:
-      email: pesnik@outlook.com
-      storage: /letsencrypt/acme.json
-      tlsChallenge: {}
-
-# ============================================================================
-# Providers
-# ============================================================================
-providers:
-  docker:
-    endpoint: "unix:///var/run/docker.sock"
-    watch: true
-    exposedByDefault: false
-    network: "n8n-network"
-    # REMOVED: swarmMode - not supported in v3
-
-# ============================================================================
-# Ping
-# ============================================================================
-ping:
-  entryPoint: traefik
+ping: {}
